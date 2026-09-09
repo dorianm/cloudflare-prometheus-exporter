@@ -9,6 +9,7 @@ import { isPaidTierGraphQLQuery } from "../cloudflare/queries";
 import { runAlarmWithRecovery } from "../lib/alarm-recovery";
 import {
 	chunkedDurableObjectStorage,
+	deleteChunkedValue,
 	loadChunkedValue,
 	saveChunkedValue,
 } from "../lib/chunked-storage";
@@ -21,6 +22,12 @@ import {
 	MetricDefinitionSchema,
 	mergeMetricDefinitions,
 } from "../lib/metrics";
+import {
+	accumulatePackedColoRows,
+	COLO_METRICS_QUERY_NAME,
+	type PackedColoMetricState,
+	PackedColoMetricStateSchema,
+} from "../lib/packed-colo-state";
 import { getConfig, type ResolvedConfig } from "../lib/runtime-config";
 import { getTimeRange } from "../lib/time";
 import {
@@ -33,8 +40,8 @@ import {
 } from "../lib/types";
 
 const STATE_KEY = "state";
+const STATE_PACKED_COLO_METRICS_KEY = "packed-colo-metrics";
 const ALARM_RECOVERY_DELAY_MS = 60 * 1000;
-
 /**
  * Maximum allowed hostnames in HOST_METRICS_ALLOWLIST.
  * Limits GraphQL variable size and prevents cardinality explosion.
@@ -401,6 +408,50 @@ export class MetricExporter extends DurableObject<Env> {
 			}
 
 			const ingestId = new Date(timeRange.maxtime).getTime();
+			if (
+				config.coloMetricsPackedStorage &&
+				state.scopeType === "account" &&
+				state.queryName === COLO_METRICS_QUERY_NAME
+			) {
+				const currentState = this.getState();
+				// Packed colo counters live outside the generic MetricDefinition[] state.
+				await this.savePackedColoMetricState(
+					result.metrics,
+					currentState,
+					ingestId,
+					result.failedScopes,
+				);
+				const refreshedState: MetricExporterState = {
+					...currentState,
+					metrics: [],
+					counters: {},
+					lastIngest: ingestId,
+					lastRefresh: Date.now(),
+					lastError: null,
+					zoneRetryAfter: result.zoneRetryAfter,
+				};
+				await this.saveState(refreshedState);
+				this.state = refreshedState;
+
+				logger.info("Refresh complete", {
+					metric_count: result.metrics.length,
+					partial_failure_count: result.partialErrors.length,
+				});
+				await this.scheduleNextAlarm(config, nextRefreshDelaySeconds);
+				return;
+			}
+
+			if (
+				state.scopeType === "account" &&
+				state.queryName === COLO_METRICS_QUERY_NAME
+			) {
+				// Packed storage is off: drop any packed snapshot so re-enabling the
+				// flag starts a fresh counter generation instead of reviving old totals.
+				await deleteChunkedValue(
+					chunkedDurableObjectStorage(this.ctx.storage),
+					STATE_PACKED_COLO_METRICS_KEY,
+				);
+			}
 			const processed = accumulateCounterMetrics(
 				result.metrics,
 				state.counters,
@@ -595,6 +646,7 @@ export class MetricExporter extends DurableObject<Env> {
 						hostMetricsAllowlist,
 						hostMetricsDelaySeconds,
 						config.httpStatusGroup,
+						config.coloMetricsPackedStorage,
 					),
 					partialErrors: [],
 					failedScopes: new Set(),
@@ -641,6 +693,7 @@ export class MetricExporter extends DurableObject<Env> {
 						hostMetricsAllowlist,
 						hostMetricsDelaySeconds,
 						config.httpStatusGroup,
+						config.coloMetricsPackedStorage,
 					);
 					for (const zoneId of chunkIds) delete zoneRetryAfter[zoneId];
 					chunkResults.push(metrics);
@@ -724,6 +777,43 @@ export class MetricExporter extends DurableObject<Env> {
 		}
 	}
 
+	private async loadPackedColoMetricState(): Promise<
+		PackedColoMetricState | undefined
+	> {
+		return loadChunkedValue(
+			chunkedDurableObjectStorage(this.ctx.storage),
+			STATE_PACKED_COLO_METRICS_KEY,
+			PackedColoMetricStateSchema,
+		);
+	}
+
+	private async savePackedColoMetricState(
+		metrics: MetricDefinition[],
+		state: MetricExporterState,
+		ingestId: number,
+		failedScopes: ReadonlySet<string>,
+	): Promise<void> {
+		const previous = await this.loadPackedColoMetricState();
+		await saveChunkedValue(
+			chunkedDurableObjectStorage(this.ctx.storage),
+			STATE_PACKED_COLO_METRICS_KEY,
+			{
+				format: "colo-packed-by-zone-v2",
+				accountId: state.accountId,
+				accountName: state.accountName,
+				queryName: COLO_METRICS_QUERY_NAME,
+				lastFetch: Date.now(),
+				lastIngest: ingestId,
+				zones: accumulatePackedColoRows(
+					previous,
+					metrics,
+					ingestId,
+					failedScopes,
+				),
+			} satisfies PackedColoMetricState,
+		);
+	}
+
 	/** Persist state in bounded storage chunks before publishing it in memory. */
 	private async saveState(state: MetricExporterState): Promise<void> {
 		await saveChunkedValue(
@@ -739,7 +829,18 @@ export class MetricExporter extends DurableObject<Env> {
 	 * @returns Current snapshot of metrics with accumulated counter values.
 	 */
 	async export(): Promise<MetricDefinition[]> {
+		return this.getState().metrics;
+	}
+
+	/** Packed colo counters, or undefined until the first packed refresh has run. */
+	async exportPackedColoMetrics(): Promise<PackedColoMetricState | undefined> {
 		const state = this.getState();
-		return state.metrics;
+		if (
+			state.scopeType !== "account" ||
+			state.queryName !== COLO_METRICS_QUERY_NAME
+		) {
+			return undefined;
+		}
+		return this.loadPackedColoMetricState();
 	}
 }

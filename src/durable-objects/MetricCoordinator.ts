@@ -4,6 +4,8 @@ import { extractErrorInfo } from "../lib/errors";
 import { filterAccountsByIds, parseCommaSeparated } from "../lib/filters";
 import { createLogger, type Logger } from "../lib/logger";
 import type { MetricDefinition } from "../lib/metrics";
+import { serializePackedColoMetrics } from "../lib/packed-colo-prometheus";
+import type { PackedColoMetricState } from "../lib/packed-colo-state";
 import { serializeToPrometheus } from "../lib/prometheus";
 import { getConfig, type ResolvedConfig } from "../lib/runtime-config";
 import type { Account } from "../lib/types";
@@ -136,12 +138,23 @@ export class MetricCoordinator extends DurableObject<Env> {
 		return accounts;
 	}
 
-	/**
-	 * Collects metrics from all accounts and serializes to Prometheus format.
-	 *
-	 * @returns Prometheus-formatted metrics string.
-	 */
-	async export(): Promise<string> {
+	override async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+		if (url.pathname !== "/export") {
+			return new Response("Not Found", { status: 404 });
+		}
+
+		try {
+			return await this.exportResponse();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return new Response(`Error collecting metrics: ${message}`, {
+				status: 500,
+			});
+		}
+	}
+
+	private async exportResponse(): Promise<Response> {
 		const config = await getConfig(this.env);
 		const logger = this.createLogger(config);
 
@@ -150,57 +163,51 @@ export class MetricCoordinator extends DurableObject<Env> {
 
 		if (accounts.length === 0) {
 			logger.warn("No accounts found");
-			return "";
+			return new Response("", {
+				headers: { "Content-Type": "text/plain; charset=utf-8" },
+			});
 		}
 
-		logger.info("Exporting metrics", { account_count: accounts.length });
+		logger.info("Streaming metrics", { account_count: accounts.length });
 
-		// Track errors by account and error code
+		return new Response(this.createExportStream(accounts, config, logger), {
+			headers: { "Content-Type": "text/plain; charset=utf-8" },
+		});
+	}
+
+	private createExportStream(
+		accounts: readonly Account[],
+		config: ResolvedConfig,
+		logger: Logger,
+	): ReadableStream<Uint8Array> {
+		const encoder = new TextEncoder();
+		const chunks = this.exportChunks(accounts, config, logger);
+		return new ReadableStream({
+			async pull(controller) {
+				try {
+					const next = await chunks.next();
+					if (next.done) controller.close();
+					else controller.enqueue(encoder.encode(next.value));
+				} catch (error) {
+					controller.error(error);
+				}
+			},
+			async cancel() {
+				await chunks.return();
+			},
+		});
+	}
+
+	private async *exportChunks(
+		accounts: readonly Account[],
+		config: ResolvedConfig,
+		logger: Logger,
+	): AsyncGenerator<string, void> {
+		const metricsDenylist = parseCommaSeparated(config.metricsDenylist);
+		const excludeLabels = config.excludeHost ? new Set(["host"]) : undefined;
+
 		const errorsByAccount: Map<string, { code: string; count: number }[]> =
 			new Map();
-
-		const results = await Promise.all(
-			accounts.map(async (account) => {
-				try {
-					const coordinator = await AccountMetricCoordinator.get(
-						account.id,
-						account.name,
-						this.env,
-					);
-					return await coordinator.export();
-				} catch (error) {
-					const info = extractErrorInfo(error);
-					logger.error("Failed to export account", {
-						account_id: account.id,
-						error_code: info.code,
-						error: info.message,
-						...(info.stack && { stack: info.stack }),
-					});
-
-					// Track error for metrics
-					const accountErrors = errorsByAccount.get(account.id) ?? [];
-					const existing = accountErrors.find((e) => e.code === info.code);
-					if (existing) {
-						existing.count++;
-					} else {
-						accountErrors.push({ code: info.code, count: 1 });
-					}
-					errorsByAccount.set(account.id, accountErrors);
-
-					return {
-						metrics: [],
-						zoneCounts: {
-							total: 0,
-							filtered: 0,
-							processed: 0,
-							skippedFreeTier: 0,
-						},
-					};
-				}
-			}),
-		);
-
-		// Aggregate stats
 		const zoneCounts = {
 			total: 0,
 			filtered: 0,
@@ -208,26 +215,66 @@ export class MetricCoordinator extends DurableObject<Env> {
 			skippedFreeTier: 0,
 		};
 		const allMetrics: MetricDefinition[] = [];
-		for (const result of results) {
-			allMetrics.push(...result.metrics);
-			zoneCounts.total += result.zoneCounts.total;
-			zoneCounts.filtered += result.zoneCounts.filtered;
-			zoneCounts.processed += result.zoneCounts.processed;
-			zoneCounts.skippedFreeTier += result.zoneCounts.skippedFreeTier;
+		const packedColoMetrics: PackedColoMetricState[] = [];
+
+		for (const account of accounts) {
+			try {
+				const coordinator = await AccountMetricCoordinator.get(
+					account.id,
+					account.name,
+					this.env,
+				);
+				// Resolve the storage mode once per scrape so every account serializes
+				// colo metrics the same way; mixed modes would duplicate HELP/TYPE lines.
+				const result = await coordinator.exportForPrometheus({
+					packedColoStorage: config.coloMetricsPackedStorage,
+				});
+				allMetrics.push(...result.metrics);
+				packedColoMetrics.push(...result.packedColoMetrics);
+				zoneCounts.total += result.zoneCounts.total;
+				zoneCounts.filtered += result.zoneCounts.filtered;
+				zoneCounts.processed += result.zoneCounts.processed;
+				zoneCounts.skippedFreeTier += result.zoneCounts.skippedFreeTier;
+			} catch (error) {
+				const info = extractErrorInfo(error);
+				logger.error("Failed to export account", {
+					account_id: account.id,
+					error_code: info.code,
+					error: info.message,
+					...(info.stack && { stack: info.stack }),
+				});
+
+				const accountErrors = errorsByAccount.get(account.id) ?? [];
+				const existing = accountErrors.find((e) => e.code === info.code);
+				if (existing) {
+					existing.count++;
+				} else {
+					accountErrors.push({ code: info.code, count: 1 });
+				}
+				errorsByAccount.set(account.id, accountErrors);
+			}
 		}
 
-		// Add exporter info metrics
-		const exporterMetrics = this.buildExporterInfoMetrics(
-			accounts.length,
-			zoneCounts,
-			errorsByAccount,
-		);
-
-		const metricsDenylist = parseCommaSeparated(config.metricsDenylist);
-		return serializeToPrometheus([...exporterMetrics, ...allMetrics], {
+		yield* serializePackedColoMetrics(packedColoMetrics, {
 			denylist: metricsDenylist,
-			excludeLabels: config.excludeHost ? new Set(["host"]) : undefined,
+			excludeLabels,
 		});
+		const remaining = serializeToPrometheus(
+			[
+				...this.buildExporterInfoMetrics(
+					accounts.length,
+					zoneCounts,
+					errorsByAccount,
+				),
+				...allMetrics,
+			],
+			{
+				denylist: metricsDenylist,
+				excludeLabels,
+			},
+		);
+		if (remaining.length > 0) yield `${remaining}\n`;
+		logger.info("Metrics streamed successfully");
 	}
 
 	/**

@@ -56,6 +56,7 @@ Set in `wrangler.jsonc` or via `wrangler secret put`:
 | `HEALTH_CHECK_CACHE_TTL_SECONDS` | 10 | Health check cache TTL |
 | `EXCLUDE_HOST` | false | Exclude host labels from metrics |
 | `CF_HTTP_STATUS_GROUP` | false | Group HTTP status codes (2xx, 4xx, etc.) |
+| `COLO_METRICS_PACKED_STORAGE` | false | Enable compact by-zone storage and chunked read output for high-cardinality `colo-metrics` rollouts. Metric names and labels are unchanged. |
 | `DISABLE_UI` | false | Disable landing page (returns 404) |
 | `DISABLE_CONFIG_API` | false | Disable config API endpoints (returns 404) |
 | `METRICS_DENYLIST` | - | Comma-separated list of metrics to exclude |
@@ -156,6 +157,7 @@ Override configuration at runtime without redeployment. Overrides persist in KV 
 | `metricsDenylist` | string | Comma-separated metrics to exclude |
 | `excludeHost` | boolean | Exclude host labels |
 | `httpStatusGroup` | boolean | Group HTTP status codes |
+| `coloMetricsPackedStorage` | boolean | Enable compact by-zone storage and chunked read output for `colo-metrics` |
 | `hostMetricsAllowlist` | string | Comma-separated hostnames for hostname-level metrics |
 | `hostMetricsDelaySeconds` | number | Ingestion delay for hostname metrics (seconds) |
 
@@ -178,12 +180,26 @@ curl -X PUT https://your-worker.workers.dev/config/cfZones \
   -H "Content-Type: application/json" \
   -d '{"value": "zone-id-1,zone-id-2"}'
 
+# Enable compact colo metric storage for trial rollout
+curl -X PUT https://your-worker.workers.dev/config/coloMetricsPackedStorage \
+  -H "Content-Type: application/json" \
+  -d '{"value": true}'
+
 # Reset to env default
 curl -X DELETE https://your-worker.workers.dev/config/logLevel
 
 # Reset all overrides
 curl -X DELETE https://your-worker.workers.dev/config
 ```
+
+### Packed colo storage
+
+`coloMetricsPackedStorage` stores `colo-metrics` in columnar form (one array per field, per zone) instead of three label-repeating metric families, and streams the output in bounded chunks. Metric names and labels are unchanged.
+
+- Toggling the flag in either direction **resets the colo counters** (Prometheus `rate()`/`increase()` handle counter resets). Disabling deletes the packed snapshot on the next refresh, so re-enabling starts from zero rather than reviving old totals. Colo metrics are absent until the first successful refresh in the new mode.
+- The storage mode is resolved once per scrape and applied to every account, so a scrape never mixes packed and unpacked colo output.
+- A `zone`/`colo`/`host` row is observed as a unit: the three counters share one retry checkpoint, and a counter Cloudflare omits for an observed row is recorded as `0`. Rows not seen for five refreshes are dropped; until then they are exported with their last value (a flat counter), whereas the unpacked path stops exporting a series the moment it is absent.
+- The 16 MiB serialized-state guard (`Chunked storage value exceeds the safe size limit`) still applies. At ~55 bytes per unique row, 150,000 rows (450,000 samples) use ~8 MiB; the ceiling is roughly 280,000 rows with typical hostnames.
 
 ## Available Metrics
 

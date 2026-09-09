@@ -12,6 +12,7 @@ import {
 } from "../lib/filters";
 import { createLogger, type Logger } from "../lib/logger";
 import type { MetricDefinition } from "../lib/metrics";
+import type { PackedColoMetricState } from "../lib/packed-colo-state";
 import { getConfig, type ResolvedConfig } from "../lib/runtime-config";
 import { getTimeRange } from "../lib/time";
 import type { Zone } from "../lib/types";
@@ -324,12 +325,13 @@ export class AccountMetricCoordinator extends DurableObject<Env> {
 	}
 
 	/**
-	 * Collects and aggregates metrics from all MetricExporter DOs.
-	 *
-	 * @returns Metrics and zone counts.
+	 * Returns normal MetricDefinition[] data plus packed colo data separately.
+	 * The caller decides the colo storage mode for the whole scrape; with packed
+	 * storage, colo-metrics are read only from packed state.
 	 */
-	async export(): Promise<{
+	async exportForPrometheus(options: { packedColoStorage: boolean }): Promise<{
 		metrics: MetricDefinition[];
+		packedColoMetrics: PackedColoMetricState[];
 		zoneCounts: {
 			total: number;
 			filtered: number;
@@ -360,10 +362,33 @@ export class AccountMetricCoordinator extends DurableObject<Env> {
 		const isFreeTierAccount = cfFreeTierSet.has(state.accountId);
 
 		const accountQueries = getActiveAccountQueries(config, isFreeTierAccount);
+		const usePackedColoMetrics =
+			options.packedColoStorage && accountQueries.includes("colo-metrics");
+		let packedColoMetrics: PackedColoMetricState[] = [];
+		if (usePackedColoMetrics) {
+			try {
+				const exporter = await MetricExporter.get(
+					`account:${state.accountId}:colo-metrics`,
+					this.env,
+				);
+				const packedColoMetricState = await exporter.exportPackedColoMetrics();
+				packedColoMetrics =
+					packedColoMetricState === undefined ? [] : [packedColoMetricState];
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				logger.error("Failed to export account metrics", {
+					query: "colo-metrics",
+					error: msg,
+				});
+			}
+		}
+		const accountMetricQueries = usePackedColoMetrics
+			? accountQueries.filter((query) => query !== "colo-metrics")
+			: accountQueries;
 
 		// Collect from account-scoped exporters
 		const accountMetricsResults = await Promise.all(
-			accountQueries.map(async (query) => {
+			accountMetricQueries.map(async (query) => {
 				try {
 					const exporter = await MetricExporter.get(
 						`account:${state.accountId}:${query}`,
@@ -407,7 +432,8 @@ export class AccountMetricCoordinator extends DurableObject<Env> {
 					),
 				);
 
-		const allMetrics = [...accountMetricsResults, ...zoneMetricsResults].flat();
+		const accountMetrics = accountMetricsResults.flat();
+		const allMetrics = [...accountMetrics, ...zoneMetricsResults.flat()];
 
 		// Count unique zones with metrics from all results
 		const zonesWithMetrics = new Set<string>();
@@ -419,6 +445,11 @@ export class AccountMetricCoordinator extends DurableObject<Env> {
 				}
 			}
 		}
+		for (const state of packedColoMetrics) {
+			for (const zoneBucket of state.zones) {
+				if (zoneBucket.colo.length > 0) zonesWithMetrics.add(zoneBucket.zone);
+			}
+		}
 		const processedZones = zonesWithMetrics.size;
 
 		// Count free tier zones
@@ -426,6 +457,7 @@ export class AccountMetricCoordinator extends DurableObject<Env> {
 
 		return {
 			metrics: allMetrics,
+			packedColoMetrics,
 			zoneCounts: {
 				total: state.totalZoneCount,
 				filtered: state.zones.length,
