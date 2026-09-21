@@ -44,6 +44,7 @@ import {
 	RequestMethodMetricsQuery,
 	StreamLiveInputsQuery,
 	StreamVideoPlaybackQuery,
+	WorkerScheduledInvocationsQuery,
 	WorkerTotalsQuery,
 } from "./gql/queries";
 import type { AccountLevelQuery, ZoneLevelQuery } from "./queries";
@@ -128,6 +129,7 @@ const WORKER_METRICS = {
 	ERRORS: "cloudflare_worker_errors_total",
 	CPU_TIME: "cloudflare_worker_cpu_time_seconds",
 	DURATION: "cloudflare_worker_duration_seconds",
+	SCHEDULED_INVOCATIONS: "cloudflare_worker_scheduled_invocations_total",
 } as const;
 // ### API Call Summary
 //
@@ -143,6 +145,7 @@ const WORKER_METRICS = {
 // | `RequestMethodMetricsQuery` | 1 | HTTP methods |
 // | `HealthCheckMetricsQuery` | 2 | Health checks |
 // | `WorkerTotalsQuery` | 4 | Account-level workers |
+// | `WorkerScheduledInvocationsQuery` | 1 | Cron Trigger invocations by outcome |
 // | `LoadBalancerMetricsQuery` | 2 | LB health/requests |
 // | `LogpushAccountMetricsQuery` | 1 | Account logpush |
 // | `LogpushZoneMetricsQuery` | 1 | Zone logpush |
@@ -495,6 +498,12 @@ export class CloudflareMetricsClient {
 					normalizedAccount,
 					timeRange,
 				);
+			case "worker-scheduled":
+				return this.getWorkerScheduledMetrics(
+					accountId,
+					normalizedAccount,
+					timeRange,
+				);
 			case "logpush-account":
 				return this.getLogpushAccountMetricsInternal(
 					accountId,
@@ -659,6 +668,91 @@ export class CloudflareMetricsClient {
 		if (durationMetric.values.length > 0) metrics.push(durationMetric);
 
 		return metrics;
+	}
+
+	/**
+	 * Fetches Cron Trigger (scheduled event) invocation counts by outcome.
+	 *
+	 * Unlike worker-totals, workersInvocationsScheduled has no Groups/sum
+	 * variant -- it returns individual invocation events, so counts are
+	 * aggregated client-side per (script_name, cron, status).
+	 *
+	 * CAVEAT: accumulateCounterMetrics (src/lib/counters.ts) only emits a
+	 * series for keys present in the *current* window, so a (script_name,
+	 * cron, status) series leaves /metrics after a single refresh cycle
+	 * without a matching invocation -- it does not linger for the
+	 * DEFAULT_STALE_COUNTER_MISSES (5) grace window; that window only keeps
+	 * the accumulated total in internal state so a reappearance within it
+	 * continues the count instead of restarting at 1. For crons firing less
+	 * often than that (~5 minutes at the default metricRefreshIntervalSeconds
+	 * =60 -- the common case: hourly/daily), the series is gone by the next
+	 * firing and restarts at 1, so rate()/increase() over it are not
+	 * meaningful. count_over_time() over such a series reflects roughly how
+	 * many scrapes caught that one refresh cycle where it was present (a
+	 * "did it run" signal), not the true invocation count. An absence check
+	 * is the reliable way to alert on a missed run. This is a limitation of
+	 * the shared counter-accumulation model, not specific to this query.
+	 *
+	 * @param accountId Cloudflare account ID.
+	 * @param normalizedAccount Normalized account name for labels.
+	 * @param timeRange Query time range.
+	 * @returns Worker scheduled-invocation metrics.
+	 */
+	private async getWorkerScheduledMetrics(
+		accountId: string,
+		normalizedAccount: string,
+		timeRange: { mintime: string; maxtime: string },
+	): Promise<MetricDefinition[]> {
+		const result = await this.gql.query(WorkerScheduledInvocationsQuery, {
+			accountID: accountId,
+			mintime: timeRange.mintime,
+			maxtime: timeRange.maxtime,
+			limit: this.config.queryLimit,
+		});
+
+		if (result.error) {
+			throw graphQLQueryError("worker-scheduled", result.error);
+		}
+
+		const limit = this.config.queryLimit;
+		const counts = new Map<
+			string,
+			{ labels: Record<string, string>; value: number }
+		>();
+		for (const accountData of result.data?.viewer?.accounts ?? []) {
+			const invocations = accountData.workersInvocationsScheduled ?? [];
+			if (invocations.length >= limit) {
+				this.logger.warn("Worker scheduled invocations may be truncated", {
+					account: normalizedAccount,
+					returned: invocations.length,
+					limit,
+				});
+			}
+			for (const invocation of invocations) {
+				const labels = {
+					script_name: invocation.scriptName ?? "unknown",
+					account: normalizedAccount,
+					cron: invocation.cron ?? "unknown",
+					status: invocation.status ?? "unknown",
+				};
+				const key = `${labels.script_name}\u0000${labels.cron}\u0000${labels.status}`;
+				const existing = counts.get(key);
+				if (existing) {
+					existing.value += 1;
+				} else {
+					counts.set(key, { labels, value: 1 });
+				}
+			}
+		}
+
+		const scheduledMetric: MetricDefinition = {
+			name: WORKER_METRICS.SCHEDULED_INVOCATIONS,
+			help: "Total number of Worker Cron Trigger invocations by outcome",
+			type: "counter",
+			values: [...counts.values()],
+		};
+
+		return scheduledMetric.values.length > 0 ? [scheduledMetric] : [];
 	}
 
 	/**

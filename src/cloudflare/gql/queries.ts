@@ -443,6 +443,31 @@ export const WorkerTotalsQuery = graphql(`
 // Note: Cloudflare's accounts filter only supports single accountTag, not accountTag_in
 // Use WorkerTotalsQuery for individual account queries
 
+// workersInvocationsScheduled has no Groups/aggregate variant (unlike
+// workersInvocationsAdaptive) -- it only returns individual scheduled
+// (Cron Trigger) invocation events, so the caller aggregates client-side.
+export const WorkerScheduledInvocationsQuery = graphql(`
+  query WorkerScheduledInvocations(
+    $accountID: string!
+    $mintime: Time!
+    $maxtime: Time!
+    $limit: uint64!
+  ) {
+    viewer {
+      accounts(filter: { accountTag: $accountID }) {
+        workersInvocationsScheduled(
+          limit: $limit
+          filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
+        ) {
+          scriptName
+          cron
+          status
+        }
+      }
+    }
+  }
+`);
+
 export const LoadBalancerMetricsQuery = graphql(`
   query LoadBalancerMetrics(
     $zoneIDs: [string!]

@@ -7,6 +7,7 @@ import z from "zod";
 export const MetricQueryNameSchema = z.enum([
 	// Account-level
 	"worker-totals",
+	"worker-scheduled",
 	"logpush-account",
 	"magic-transit",
 	"magic-transit-slo",
@@ -44,6 +45,7 @@ export type MetricQueryName = z.infer<typeof MetricQueryNameSchema>;
  */
 export const ACCOUNT_LEVEL_QUERIES = [
 	"worker-totals",
+	"worker-scheduled",
 	"logpush-account",
 	"magic-transit",
 	"magic-transit-slo",
@@ -112,6 +114,7 @@ export function isZoneLevelQuery(query: string): query is ZoneLevelQuery {
  */
 export const FREE_TIER_QUERIES = [
 	"worker-totals",
+	"worker-scheduled",
 	"logpush-account",
 	"magic-transit",
 	"magic-transit-slo",

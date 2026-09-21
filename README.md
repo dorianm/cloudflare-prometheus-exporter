@@ -283,6 +283,9 @@ curl -X DELETE https://your-worker.workers.dev/config
 | `cloudflare_worker_errors_total` | counter | script_name |
 | `cloudflare_worker_cpu_time_seconds` | gauge | script_name, quantile |
 | `cloudflare_worker_duration_seconds` | gauge | script_name, quantile |
+| `cloudflare_worker_scheduled_invocations_total` | counter | script_name, cron, status |
+
+`cloudflare_worker_scheduled_invocations_total` only has a series while its cron is actively firing. For crons slower than the ~5-minute counter-staleness window (the common case: hourly/daily), the series resets to 1 every run, so `rate()`/`increase()` are not meaningful on it -- use `count_over_time()` or an absence check instead.
 
 ### Load Balancer Metrics
 
@@ -543,15 +546,15 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │   ▼            ▼      ▼            ▼      ▼            ▼                       │
 │ ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐  ┌─────┐    ┌─────┐                     │
 │ │Exprt│    │Exprt│  │Exprt│    │Exprt│  │Exprt│    │Exprt│                     │
-│ │(21) │ .. │(N)  │  │(21) │ .. │(N)  │  │(21) │ .. │(N)  │                     │
+│ │(22) │ .. │(N)  │  │(22) │ .. │(N)  │  │(22) │ .. │(N)  │                     │
 │ │acct │    │zone │  │acct │    │zone │  │acct │    │zone │                     │
 │ └─────┘    └─────┘  └─────┘    └─────┘  └─────┘    └─────┘                     │
 │                                                                                │
 │  MetricExporter DOs (per account):                                             │
-│  - Account-scoped (21): worker-totals, logpush-account, magic-transit,         │
-│    magic-transit-slo, magic-transit-traffic, magic-firewall-samples,           │
-│    network-analytics, stream-video-playback, stream-live-inputs,              │
-│    http-metrics, adaptive-metrics, edge-country-metrics,                      │
+│  - Account-scoped (22): worker-totals, worker-scheduled, logpush-account,      │
+│    magic-transit, magic-transit-slo, magic-transit-traffic,                    │
+│    magic-firewall-samples, network-analytics, stream-video-playback,           │
+│    stream-live-inputs, http-metrics, adaptive-metrics, edge-country-metrics,   │
 │    colo-metrics, colo-error-metrics, request-method-metrics,                   │
 │    health-check-metrics, load-balancer-metrics, logpush-zone,                  │
 │    origin-status-metrics, cache-miss-metrics, hostname-http-metrics            │
@@ -602,7 +605,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
   ▼           ▼         ▼           ▼         ▼           ▼
 ┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐    ┌─────┐   ┌─────┐
 │Exprt│...│Exprt│    │Exprt│...│Exprt│    │Exprt│...│Exprt│
-│21+N │   │     │    │21+N │   │     │    │21+N │   │     │
+│22+N │   │     │    │22+N │   │     │    │22+N │   │     │
 │     │   │     │    │     │   │     │    │     │   │     │
 │ ret │   │ ret │    │ ret │   │ ret │    │ ret │   │ ret │
 │cache│   │cache│    │cache│   │cache│    │cache│   │cache│
@@ -663,7 +666,7 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 │                                                                        │
 │  3. Push context to MetricExporter DOs:                                │
 │     ┌────────────────────────────────────────────────────────────────┐ │
-│     │ Account-scoped (21 exporters):                                 │ │
+│     │ Account-scoped (22 exporters):                                 │ │
 │     │   exporter.updateZoneContext(accountId, accountName, zones)    │ │
 │     │                                                                │ │
 │     │ Zone-scoped (N exporters, 1 per zone):                         │ │
@@ -680,9 +683,10 @@ For mixed accounts (enterprise + free zones), only free zones are skipped—paid
 ┌────────────────────────────────────────────────────────────────────────┐
 │           MetricExporter.refresh() for account-scoped queries          │
 │                                                                        │
-│  Query Types (21 total):                                               │
-│  ├── ACCOUNT-LEVEL (single account per query, 9):                      │
+│  Query Types (22 total):                                               │
+│  ├── ACCOUNT-LEVEL (single account per query, 10):                     │
 │  │   ├── worker-totals                                                 │
+│  │   ├── worker-scheduled                                              │
 │  │   ├── logpush-account                                               │
 │  │   ├── magic-transit                                                 │
 │  │   ├── magic-transit-slo                                             │

@@ -66,6 +66,7 @@ describe("CloudflareMetricsClient", () => {
 
 	it.each([
 		"worker-totals",
+		"worker-scheduled",
 		"logpush-account",
 		"magic-transit",
 		"magic-transit-slo",
@@ -184,6 +185,163 @@ describe("CloudflareMetricsClient", () => {
 				(metric) => metric.name === "cloudflare_zone_requests_status_total",
 			)?.values,
 		).toEqual(expected);
+	});
+
+	it("aggregates raw scheduled-invocation events into per (script, cron, status) counters", async () => {
+		const fetch: typeof globalThis.fetch = async () =>
+			new Response(
+				JSON.stringify({
+					data: {
+						viewer: {
+							accounts: [
+								{
+									workersInvocationsScheduled: [
+										{
+											scriptName: "my-worker",
+											cron: "0 * * * *",
+											status: "success",
+										},
+										{
+											scriptName: "my-worker",
+											cron: "0 * * * *",
+											status: "success",
+										},
+										{
+											scriptName: "my-worker",
+											cron: "0 * * * *",
+											status: "scriptThrewException",
+										},
+										{
+											scriptName: "other-worker",
+											cron: "*/15 * * * *",
+											status: "success",
+										},
+									],
+								},
+							],
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		const client = createClient(fetch);
+
+		const metrics = await client.getAccountMetrics(
+			"worker-scheduled",
+			"account-id",
+			"Account",
+			{
+				mintime: "2026-01-01T00:00:00.000Z",
+				maxtime: "2026-01-01T00:01:00.000Z",
+			},
+		);
+
+		expect(
+			metrics.find(
+				(metric) =>
+					metric.name === "cloudflare_worker_scheduled_invocations_total",
+			)?.values,
+		).toEqual(
+			expect.arrayContaining([
+				{
+					labels: {
+						script_name: "my-worker",
+						account: "account",
+						cron: "0 * * * *",
+						status: "success",
+					},
+					value: 2,
+				},
+				{
+					labels: {
+						script_name: "my-worker",
+						account: "account",
+						cron: "0 * * * *",
+						status: "scriptThrewException",
+					},
+					value: 1,
+				},
+				{
+					labels: {
+						script_name: "other-worker",
+						account: "account",
+						cron: "*/15 * * * *",
+						status: "success",
+					},
+					value: 1,
+				},
+			]),
+		);
+	});
+
+	it("sends the expected variables and field selection for worker-scheduled", async () => {
+		const timeRange = {
+			mintime: "2026-01-01T00:00:00.000Z",
+			maxtime: "2026-01-01T00:01:00.000Z",
+		};
+		const fields: string[] = [];
+		const client = createClient(async (input, init) => {
+			const body = z
+				.object({
+					query: z.string(),
+					variables: z.object({
+						accountID: z.string(),
+						mintime: z.string(),
+						maxtime: z.string(),
+						limit: z.number(),
+					}),
+				})
+				.parse(await new Request(input, init).json());
+			expect(body.variables).toEqual({
+				accountID: "account-id",
+				...timeRange,
+				limit: 100,
+			});
+			visit(parse(body.query), {
+				Field(node) {
+					fields.push(node.name.value);
+				},
+			});
+			return Response.json({ data: { viewer: { accounts: [] } } });
+		});
+
+		await client.getAccountMetrics(
+			"worker-scheduled",
+			"account-id",
+			"Account",
+			timeRange,
+		);
+
+		expect(fields).toEqual(
+			expect.arrayContaining([
+				"workersInvocationsScheduled",
+				"scriptName",
+				"cron",
+				"status",
+			]),
+		);
+	});
+
+	it("returns no metrics when an account has no scheduled invocations", async () => {
+		const fetch: typeof globalThis.fetch = async () =>
+			new Response(
+				JSON.stringify({
+					data: {
+						viewer: {
+							accounts: [{ workersInvocationsScheduled: [] }],
+						},
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		const client = createClient(fetch);
+
+		await expect(
+			client.getAccountMetrics("worker-scheduled", "account-id", "Account", {
+				mintime: "2026-01-01T00:00:00.000Z",
+				maxtime: "2026-01-01T00:01:00.000Z",
+			}),
+		).resolves.toEqual([]);
 	});
 
 	it.each([
